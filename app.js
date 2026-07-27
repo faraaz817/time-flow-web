@@ -683,6 +683,29 @@ function el(tag, attrs = {}, children = []) {
   return node;
 }
 
+/** Soft keyboards often lack Enter — keep Enter when available, always show a Next button. */
+function wireGoKey(input, onGo) {
+  input.setAttribute("enterkeyhint", "go");
+  if (!input.getAttribute("inputmode")) {
+    input.setAttribute("inputmode", input.type === "number" ? "numeric" : "text");
+  }
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      onGo();
+    }
+  });
+}
+
+function nextButton(label, onClick) {
+  return el("button", {
+    className: "btn btn-primary btn-block btn-touch",
+    type: "button",
+    text: label,
+    onClick,
+  });
+}
+
 function shell(children) {
   return el("div", { className: "shell" }, children);
 }
@@ -1995,23 +2018,22 @@ function renderRemind() {
     const titleInput = el("input", {
       value: w.title,
       placeholder: "e.g. Take medication",
+      autocomplete: "off",
       onInput: (e) => {
         w.title = e.target.value;
       },
     });
-    titleInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        if (!w.title.trim()) return;
-        w.step = 2;
-        render();
-      }
-    });
+    const goNext = () => {
+      if (!w.title.trim()) return;
+      w.step = 2;
+      render();
+    };
+    wireGoKey(titleInput, goNext);
     body = el("div", { className: "panel stack" }, [
       el("p", { className: "step-meta", text: editing ? "Edit reminder" : "Remind me" }),
       el("h2", { text: "Remind me to…" }),
       el("div", { className: "field" }, [el("label", { text: "What?" }), titleInput]),
-      el("p", { className: "meta small", text: "Press Enter to continue" }),
+      nextButton("Next", goNext),
     ]);
     setTimeout(() => titleInput.focus(), 0);
   } else {
@@ -2064,22 +2086,32 @@ function renderRemind() {
         ]
       ),
       w.mode === "DATETIME" &&
-        el("div", { className: "field" }, [
-          el("label", { text: "Date & time" }),
-          el("input", {
-            type: "datetime-local",
-            value: w.datetimeLocal,
-            onChange: (e) => {
-              w.datetimeLocal = e.target.value;
-              if (!w.datetimeLocal) return;
-              if (new Date(w.datetimeLocal).getTime() <= Date.now()) {
-                alert("Pick a time in the future.");
-                return;
-              }
-              saveReminderFromWizard();
-            },
-          }),
-        ]),
+        (() => {
+          const saveAt = () => {
+            if (!w.datetimeLocal) {
+              alert("Pick a date and time.");
+              return;
+            }
+            if (new Date(w.datetimeLocal).getTime() <= Date.now()) {
+              alert("Pick a time in the future.");
+              return;
+            }
+            saveReminderFromWizard();
+          };
+          return el("div", { className: "stack" }, [
+            el("div", { className: "field" }, [
+              el("label", { text: "Date & time" }),
+              el("input", {
+                type: "datetime-local",
+                value: w.datetimeLocal,
+                onChange: (e) => {
+                  w.datetimeLocal = e.target.value;
+                },
+              }),
+            ]),
+            nextButton("Save reminder", saveAt),
+          ]);
+        })(),
       w.mode === "TIMER" &&
         el("div", { className: "stack" }, [
           el(
@@ -2100,20 +2132,20 @@ function renderRemind() {
             const custom = el("input", {
               type: "number",
               min: "1",
+              inputmode: "numeric",
               value: String(w.timerMinutes),
               onInput: (e) => {
                 w.timerMinutes = Math.max(1, Number(e.target.value) || 1);
               },
             });
-            custom.addEventListener("keydown", (e) => {
-              if (e.key === "Enter") {
-                e.preventDefault();
-                saveReminderFromWizard();
-              }
-            });
-            return el("div", { className: "field" }, [
-              el("label", { text: "Custom minutes — press Enter" }),
-              custom,
+            const saveCustom = () => saveReminderFromWizard();
+            wireGoKey(custom, saveCustom);
+            return el("div", { className: "stack" }, [
+              el("div", { className: "field" }, [
+                el("label", { text: "Custom minutes" }),
+                custom,
+              ]),
+              nextButton("Save timer", saveCustom),
             ]);
           })(),
         ]),
@@ -2168,10 +2200,14 @@ function renderRemind() {
                   value: w.repeatTime,
                   onChange: (e) => {
                     w.repeatTime = e.target.value;
-                    trySaveRepeatReminder();
                   },
                 }),
               ]),
+              nextButton("Save reminder", () => {
+                if (!trySaveRepeatReminder()) {
+                  alert("Pick at least one day and a time.");
+                }
+              }),
             ]),
           w.repeatCadence === "MONTHLY" &&
             el("div", { className: "stack" }, [
@@ -2194,10 +2230,14 @@ function renderRemind() {
                   value: w.repeatTime,
                   onChange: (e) => {
                     w.repeatTime = e.target.value;
-                    trySaveRepeatReminder();
                   },
                 }),
               ]),
+              nextButton("Save reminder", () => {
+                if (!trySaveRepeatReminder()) {
+                  alert("Pick at least one day and a time.");
+                }
+              }),
             ]),
         ]),
     ]);
@@ -2314,18 +2354,17 @@ function renderWizard() {
     const titleInput = el("input", {
       value: w.title,
       placeholder: "e.g. Pay electricity bill",
+      autocomplete: "off",
       onInput: (e) => {
         w.title = e.target.value;
       },
     });
-    titleInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        if (!w.title.trim()) return;
-        w.step = 2;
-        render();
-      }
-    });
+    const goNext = () => {
+      if (!w.title.trim()) return;
+      w.step = 2;
+      render();
+    };
+    wireGoKey(titleInput, goNext);
     body = el("div", { className: "panel stack" }, [
       el("p", { className: "step-meta", text: editing ? "Edit goal · 1 of 4" : "Step 1 of 4" }),
       el("h2", { text: editing ? "Edit goal" : "What’s the goal?" }),
@@ -2334,12 +2373,13 @@ function renderWizard() {
         el("label", { text: "Notes (optional)" }),
         el("textarea", {
           text: w.notes,
+          rows: "3",
           onInput: (e) => {
             w.notes = e.target.value;
           },
         }),
       ]),
-      el("p", { className: "meta small", text: "Press Enter on the goal to continue" }),
+      nextButton("Next", goNext),
     ]);
     setTimeout(() => titleInput.focus(), 0);
   } else if (w.step === 2) {
@@ -2462,20 +2502,20 @@ function renderWizard() {
         const custom = el("input", {
           type: "number",
           min: "1",
+          inputmode: "numeric",
           value: String(w.estimatedMinutes),
           onInput: (e) => {
             w.estimatedMinutes = Math.max(1, Number(e.target.value) || 1);
           },
         });
-        custom.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            saveGoalFromWizard();
-          }
-        });
-        return el("div", { className: "field" }, [
-          el("label", { text: "Custom minutes — press Enter" }),
-          custom,
+        const save = () => saveGoalFromWizard();
+        wireGoKey(custom, save);
+        return el("div", { className: "stack" }, [
+          el("div", { className: "field" }, [
+            el("label", { text: "Custom minutes" }),
+            custom,
+          ]),
+          nextButton("Save goal", save),
         ]);
       })(),
     ]);
@@ -2569,23 +2609,22 @@ function renderTargetWizard() {
     const titleInput = el("input", {
       value: w.title,
       placeholder: "e.g. Workout",
+      autocomplete: "off",
       onInput: (e) => {
         w.title = e.target.value;
       },
     });
-    titleInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        if (!w.title.trim()) return;
-        w.step = 2;
-        render();
-      }
-    });
+    const goNext = () => {
+      if (!w.title.trim()) return;
+      w.step = 2;
+      render();
+    };
+    wireGoKey(titleInput, goNext);
     body = el("div", { className: "panel stack" }, [
       el("p", { className: "step-meta", text: editing ? "Edit target" : "New target" }),
       el("h2", { text: "What’s the target?" }),
       el("div", { className: "field" }, [el("label", { text: "Target" }), titleInput]),
-      el("p", { className: "meta small", text: "Press Enter to continue" }),
+      nextButton("Next", goNext),
     ]);
     setTimeout(() => titleInput.focus(), 0);
   } else if (w.step === 2) {
@@ -2636,21 +2675,23 @@ function renderTargetWizard() {
         const custom = el("input", {
           type: "number",
           min: "1",
+          inputmode: "numeric",
           value: String(w.estimatedMinutes),
           onInput: (e) => {
             w.estimatedMinutes = Math.max(1, Number(e.target.value) || 1);
           },
         });
-        custom.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            w.step = 4;
-            render();
-          }
-        });
-        return el("div", { className: "field" }, [
-          el("label", { text: "Custom minutes — press Enter" }),
-          custom,
+        const goNext = () => {
+          w.step = 4;
+          render();
+        };
+        wireGoKey(custom, goNext);
+        return el("div", { className: "stack" }, [
+          el("div", { className: "field" }, [
+            el("label", { text: "Custom minutes" }),
+            custom,
+          ]),
+          nextButton("Next", goNext),
         ]);
       })(),
     ]);
@@ -2703,20 +2744,20 @@ function renderTargetWizard() {
         const custom = el("input", {
           type: "number",
           min: "1",
+          inputmode: "numeric",
           value: String(w.frequency),
           onInput: (e) => {
             w.frequency = Math.max(1, Number(e.target.value) || 1);
           },
         });
-        custom.addEventListener("keydown", (e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            saveTargetFromWizard();
-          }
-        });
-        return el("div", { className: "field" }, [
-          el("label", { text: "Custom — press Enter" }),
-          custom,
+        const save = () => saveTargetFromWizard();
+        wireGoKey(custom, save);
+        return el("div", { className: "stack" }, [
+          el("div", { className: "field" }, [
+            el("label", { text: "Custom times" }),
+            custom,
+          ]),
+          nextButton("Save target", save),
         ]);
       })(),
     ]);
@@ -2939,18 +2980,17 @@ function renderSprint() {
     const titleInput = el("input", {
       value: d.title,
       placeholder: "e.g. Draft intro slides",
+      autocomplete: "off",
       onInput: (e) => {
         d.title = e.target.value;
       },
     });
-    titleInput.addEventListener("keydown", (e) => {
-      if (e.key === "Enter") {
-        e.preventDefault();
-        if (!d.title.trim()) return;
-        d.step = 2;
-        render();
-      }
-    });
+    const goNext = () => {
+      if (!d.title.trim()) return;
+      d.step = 2;
+      render();
+    };
+    wireGoKey(titleInput, goNext);
     return shell([
       back,
       el("div", { className: "panel stack" }, [
@@ -2964,18 +3004,10 @@ function renderSprint() {
           text: "Sprint tasks exist only for this run — nothing is saved to Goals, Targets, or the calendar.",
         }),
         el("div", { className: "field" }, [el("label", { text: "Name" }), titleInput]),
-        el("button", {
-          className: "btn btn-primary btn-block",
-          text: "Next",
-          onClick: () => {
-            if (!d.title.trim()) return;
-            d.step = 2;
-            render();
-          },
-        }),
+        nextButton("Next", goNext),
         count
           ? el("button", {
-              className: "btn btn-ghost btn-block",
+              className: "btn btn-ghost btn-block btn-touch",
               text: `Prepare ${count} task${count === 1 ? "" : "s"}`,
               onClick: () => {
                 state.sprintDraft = { step: 1, title: "", estimatedMinutes: 25 };
