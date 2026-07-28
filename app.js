@@ -1,6 +1,8 @@
 const STORAGE_KEY = "timeflow.goals.v1";
 const REMINDER_KEY = "timeflow.reminders.v1";
 const TARGET_KEY = "timeflow.targets.v1";
+const SEED_KEY = "timeflow.seeded.v1";
+const PREFS_KEY = "timeflow.prefs.v1";
 
 const Importance = {
   VERY_IMPORTANT: { id: "VERY_IMPORTANT", label: "Very important", weight: 3, color: "red" },
@@ -81,6 +83,41 @@ function loadTargets() {
 
 function saveTargets(targets) {
   localStorage.setItem(TARGET_KEY, JSON.stringify(targets));
+}
+
+function loadPrefs() {
+  try {
+    const raw = localStorage.getItem(PREFS_KEY);
+    const p = raw ? JSON.parse(raw) : {};
+    const notifications = ["off", "soft", "full"].includes(p.notifications)
+      ? p.notifications
+      : "soft";
+    return { notifications };
+  } catch {
+    return { notifications: "soft" };
+  }
+}
+
+function savePrefs(prefs) {
+  localStorage.setItem(PREFS_KEY, JSON.stringify(prefs));
+}
+
+function getNotificationMode() {
+  return state.prefs?.notifications || "soft";
+}
+
+function setNotificationMode(mode) {
+  state.prefs = { ...state.prefs, notifications: mode };
+  savePrefs(state.prefs);
+  if (mode === "off") {
+    clearNativeReminders();
+    clearNativeTimers();
+  } else {
+    syncNativeReminders();
+    syncNativeTimers();
+    if (mode !== "off") ensureNotificationPermission();
+  }
+  render();
 }
 
 /** Monday-based local week / calendar day / month / year starts */
@@ -215,7 +252,7 @@ function targetToPackItem(target, now = Date.now()) {
 function availableTargets(targets, now = Date.now()) {
   return targets
     .map((t) => ensureTargetPeriod(t, now))
-    .filter((t) => t.completionsInPeriod < t.frequency);
+    .filter((t) => !t.paused && t.completionsInPeriod < t.frequency);
 }
 
 function packTasks(goals, targets, freeMinutes, now = Date.now()) {
@@ -340,6 +377,10 @@ const state = {
   calendarCursor: Date.now(),
   returnScreen: null,
   itemDetail: null,
+  dialog: null,
+  prefs: loadPrefs(),
+  quickCapture: false,
+  completeFlash: null,
 };
 
 {
@@ -350,9 +391,12 @@ const state = {
   }
 }
 
-if (!state.goals.length) {
+if (!state.goals.length && !localStorage.getItem(SEED_KEY)) {
   state.goals = createSeedGoals();
   saveGoals(state.goals);
+  localStorage.setItem(SEED_KEY, "1");
+} else if (!localStorage.getItem(SEED_KEY)) {
+  localStorage.setItem(SEED_KEY, "1");
 }
 
 const app = document.getElementById("app");
@@ -365,6 +409,7 @@ function setGoals(next) {
 function setReminders(next) {
   state.reminders = next;
   saveReminders(next);
+  syncNativeReminders();
 }
 
 function setTargets(next) {
@@ -372,7 +417,39 @@ function setTargets(next) {
   saveTargets(next);
 }
 
+function androidBridge() {
+  return typeof window !== "undefined" && window.TimeFlowAndroid ? window.TimeFlowAndroid : null;
+}
+
+function notificationsSupported() {
+  return Boolean(androidBridge()) || ("Notification" in window);
+}
+
+function hasNotificationPermission() {
+  const bridge = androidBridge();
+  if (bridge) {
+    try {
+      return bridge.hasNotificationPermission();
+    } catch {
+      return false;
+    }
+  }
+  return "Notification" in window && Notification.permission === "granted";
+}
+
 async function ensureNotificationPermission() {
+  const bridge = androidBridge();
+  if (bridge) {
+    try {
+      if (bridge.hasNotificationPermission()) return true;
+      if (typeof bridge.requestNotificationPermission === "function") {
+        bridge.requestNotificationPermission();
+      }
+      return false;
+    } catch {
+      // fall through
+    }
+  }
   if (!("Notification" in window)) return false;
   if (Notification.permission === "granted") return true;
   if (Notification.permission === "denied") return false;
@@ -380,19 +457,191 @@ async function ensureNotificationPermission() {
   return result === "granted";
 }
 
-function fireReminderNotification(reminder) {
-  if (!("Notification" in window) || Notification.permission !== "granted") return;
+window.onAndroidNotificationPermissionResult = (granted) => {
+  if (granted) {
+    syncNativeReminders();
+    syncNativeTimers();
+  }
+  render();
+};
+
+function syncNativeReminders() {
+  const bridge = androidBridge();
+  if (!bridge) return;
   try {
-    const n = new Notification("Time Flow — Remind me", {
-      body: reminder.title,
-      tag: `reminder-${reminder.id}`,
-      requireInteraction: true,
-    });
-    n.onclick = () => {
-      window.focus();
-      go("home");
-      n.close();
+    if (getNotificationMode() === "off") {
+      bridge.syncReminders(JSON.stringify([]));
+      return;
+    }
+    const payload = state.reminders
+      .filter((r) => r.status === "SCHEDULED" && r.triggerAt && r.triggerAt > Date.now())
+      .map((r) => ({ id: r.id, title: r.title, triggerAt: r.triggerAt }));
+    bridge.syncReminders(JSON.stringify(payload));
+  } catch {
+    // ignore
+  }
+}
+
+function clearNativeReminders() {
+  const bridge = androidBridge();
+  if (!bridge) return;
+  try {
+    bridge.syncReminders(JSON.stringify([]));
+  } catch {
+    // ignore
+  }
+}
+
+const recentNotifications = new Map();
+
+function playAlertSound(mode = getNotificationMode()) {
+  if (mode === "off") return;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const now = ctx.currentTime;
+    const volume = mode === "soft" ? 0.14 : 0.22;
+    const playTone = (freq, start, dur) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, now + start);
+      gain.gain.exponentialRampToValueAtTime(volume, now + start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + start + dur);
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      osc.start(now + start);
+      osc.stop(now + start + dur + 0.02);
     };
+    playTone(880, 0, 0.16);
+    playTone(1175, 0.2, 0.2);
+    setTimeout(() => {
+      try {
+        ctx.close();
+      } catch {
+        // ignore
+      }
+    }, 600);
+  } catch {
+    // ignore — sound is best-effort
+  }
+}
+
+function fireAppNotification({ heading, body, tag }) {
+  const mode = getNotificationMode();
+  if (mode === "off") return;
+
+  const key = tag || body;
+  const now = Date.now();
+  if (recentNotifications.get(key) && now - recentNotifications.get(key) < 3000) return;
+  recentNotifications.set(key, now);
+
+  playAlertSound(mode);
+  const soft = mode === "soft";
+
+  const bridge = androidBridge();
+  if (bridge) {
+    try {
+      if (bridge.hasNotificationPermission()) {
+        if (soft && typeof bridge.showNotificationSoft === "function") {
+          bridge.showNotificationSoft(heading, body);
+        } else {
+          bridge.showNotification(heading, body);
+        }
+      }
+      return;
+    } catch {
+      // fall through
+    }
+  }
+
+  if ("Notification" in window && Notification.permission === "granted") {
+    try {
+      const n = new Notification(heading, {
+        body,
+        tag: tag || `timeflow-${now}`,
+        requireInteraction: !soft,
+        silent: false,
+      });
+      n.onclick = () => {
+        window.focus();
+        go("home");
+        n.close();
+      };
+      return;
+    } catch {
+      // fall through
+    }
+  }
+
+  if (navigator.serviceWorker?.controller) {
+    navigator.serviceWorker.controller.postMessage({
+      type: "APP_NOTIFICATION",
+      heading,
+      body,
+      tag: tag || `timeflow-${now}`,
+      soft,
+    });
+  }
+}
+
+function fireReminderNotification(reminder) {
+  fireAppNotification({
+    heading: "Time Flow — Remind me",
+    body: reminder.title,
+    tag: `reminder-${reminder.id}`,
+  });
+}
+
+function fireTimeUpNotification(title, tag) {
+  fireAppNotification({
+    heading: "Time Flow — Time's up",
+    body: title,
+    tag: tag || `timer-${Date.now()}`,
+  });
+}
+
+function syncNativeTimers() {
+  const bridge = androidBridge();
+  if (!bridge) return;
+  try {
+    const session = state.session;
+    if (getNotificationMode() === "off" || !session || session.paused) {
+      bridge.syncTimers(JSON.stringify([]));
+      return;
+    }
+    const now = Date.now();
+    const timers = [];
+    const current = session.queue[session.index];
+    if (current && session.taskLeft > 0) {
+      timers.push({
+        id: `task-${session.index}`,
+        title: current.title,
+        triggerAt: now + session.taskLeft * 1000,
+        heading: "Time Flow — Time's up",
+      });
+    }
+    if (session.sessionLeft > 0) {
+      timers.push({
+        id: "session-end",
+        title: session.mode === "sprint" ? "Sprint finished" : "Focus session finished",
+        triggerAt: now + session.sessionLeft * 1000,
+        heading: "Time Flow — Time's up",
+      });
+    }
+    bridge.syncTimers(JSON.stringify(timers));
+  } catch {
+    // ignore
+  }
+}
+
+function clearNativeTimers() {
+  const bridge = androidBridge();
+  if (!bridge) return;
+  try {
+    bridge.syncTimers(JSON.stringify([]));
   } catch {
     // ignore
   }
@@ -464,10 +713,20 @@ function startTick() {
     state.session.taskLeft = Math.max(0, state.session.taskLeft - 1);
 
     if (state.session.taskLeft === 0) {
+      const current = state.session.queue[state.session.index];
+      if (current && !androidBridge()) {
+        fireTimeUpNotification(current.title, `task-${state.session.index}`);
+      }
       autoAdvance("auto");
       return;
     }
     if (state.session.sessionLeft === 0) {
+      if (!androidBridge()) {
+        fireTimeUpNotification(
+          state.session.mode === "sprint" ? "Sprint finished" : "Focus session finished",
+          "session-end"
+        );
+      }
       endSession();
       return;
     }
@@ -491,11 +750,13 @@ function autoAdvance(reason) {
   const next = session.queue[nextIndex];
   session.taskTotal = next.estimatedMinutes * 60;
   session.taskLeft = session.taskTotal;
+  syncNativeTimers();
   render();
 }
 
 function endSession() {
   stopTick();
+  clearNativeTimers();
   const session = state.session;
   if (!session) return;
   const now = Date.now();
@@ -646,6 +907,106 @@ function saveTargetFromWizard() {
   finishWizard("targets");
 }
 
+function closeDialog() {
+  state.dialog = null;
+  render();
+}
+
+function showAlert(message, { title = "Time Flow", okLabel = "OK" } = {}) {
+  state.dialog = {
+    kind: "alert",
+    title,
+    message,
+    okLabel,
+  };
+  render();
+}
+
+function showConfirm(
+  message,
+  onConfirm,
+  {
+    title = "Time Flow",
+    confirmLabel = "Confirm",
+    cancelLabel = "Cancel",
+    danger = false,
+  } = {}
+) {
+  state.dialog = {
+    kind: "confirm",
+    title,
+    message,
+    confirmLabel,
+    cancelLabel,
+    danger,
+    onConfirm,
+  };
+  render();
+}
+
+function renderDialog() {
+  const d = state.dialog;
+  if (!d) return null;
+
+  const dismiss = () => closeDialog();
+  const actions =
+    d.kind === "confirm"
+      ? [
+          el("button", {
+            className: "btn btn-ghost btn-block btn-touch",
+            type: "button",
+            text: d.cancelLabel || "Cancel",
+            onClick: dismiss,
+          }),
+          el("button", {
+            className: `btn ${d.danger ? "btn-danger-solid" : "btn-primary"} btn-block btn-touch`,
+            type: "button",
+            text: d.confirmLabel || "Confirm",
+            onClick: () => {
+              const fn = d.onConfirm;
+              state.dialog = null;
+              if (typeof fn === "function") fn();
+              else render();
+            },
+          }),
+        ]
+      : [
+          el("button", {
+            className: "btn btn-primary btn-block btn-touch",
+            type: "button",
+            text: d.okLabel || "OK",
+            onClick: dismiss,
+          }),
+        ];
+
+  return el(
+    "div",
+    {
+      className: "dialog-backdrop",
+      role: "presentation",
+      onClick: (e) => {
+        if (e.target === e.currentTarget) dismiss();
+      },
+    },
+    [
+      el(
+        "div",
+        {
+          className: "dialog-card",
+          role: "dialog",
+          "aria-modal": "true",
+          "aria-labelledby": "dialog-title",
+        },
+        [
+          el("h2", { id: "dialog-title", className: "dialog-title", text: d.title || "Time Flow" }),
+          el("p", { className: "dialog-message", text: d.message || "" }),
+          el("div", { className: "dialog-actions" }, actions),
+        ]
+      ),
+    ]
+  );
+}
+
 function render() {
   const map = {
     home: renderHome,
@@ -663,9 +1024,20 @@ function render() {
     focus: renderFocus,
     summary: renderSummary,
     itemDetail: renderItemDetail,
+    alerts: renderAlerts,
   };
   app.innerHTML = "";
-  app.appendChild(map[state.screen]());
+  const root = map[state.screen]();
+  if (state.session && state.screen !== "focus" && state.screen !== "summary") {
+    root.classList.add("shell-with-sticky");
+  }
+  app.appendChild(root);
+  const sticky = renderStickySession();
+  if (sticky) app.appendChild(sticky);
+  const flash = renderCompleteFlash();
+  if (flash) app.appendChild(flash);
+  const dialog = renderDialog();
+  if (dialog) app.appendChild(dialog);
 }
 
 function el(tag, attrs = {}, children = []) {
@@ -708,6 +1080,204 @@ function nextButton(label, onClick) {
 
 function shell(children) {
   return el("div", { className: "shell" }, children);
+}
+
+function flashComplete() {
+  state.completeFlash = Date.now();
+  setTimeout(() => {
+    if (!state.completeFlash) return;
+    state.completeFlash = null;
+    render();
+  }, 750);
+}
+
+function renderCompleteFlash() {
+  if (!state.completeFlash) return null;
+  return el("div", { className: "complete-flash", "aria-live": "polite" }, [
+    el("div", { className: "complete-flash-mark", text: "✓" }),
+  ]);
+}
+
+function renderStickySession() {
+  if (!state.session || state.screen === "focus" || state.screen === "summary") return null;
+  const session = state.session;
+  const current = session.queue[session.index];
+  const isSprint = session.mode === "sprint";
+  return el("div", { className: "sticky-session", role: "status" }, [
+    el(
+      "button",
+      {
+        className: "sticky-session-main",
+        type: "button",
+        onClick: () => go("focus"),
+      },
+      [
+        el("span", {
+          className: "sticky-session-label",
+          text: session.paused ? "Paused" : isSprint ? "Sprint" : "In focus",
+        }),
+        el("span", {
+          className: "sticky-session-title",
+          text: current?.title || "Session",
+        }),
+        el("span", {
+          className: "sticky-session-time",
+          text: formatClock(session.taskLeft),
+        }),
+      ]
+    ),
+    el("button", {
+      className: "sticky-session-pause",
+      type: "button",
+      title: session.paused ? "Resume" : "Pause",
+      "aria-label": session.paused ? "Resume" : "Pause",
+      text: session.paused ? "▶" : "❚❚",
+      onClick: (e) => {
+        e.stopPropagation();
+        session.paused = !session.paused;
+        syncNativeTimers();
+        render();
+      },
+    }),
+  ]);
+}
+
+function renderAlerts() {
+  const mode = getNotificationMode();
+  const options = [
+    {
+      id: "off",
+      label: "Off",
+      hint: "No sound or push alerts. Lists and timers still work in the app.",
+    },
+    {
+      id: "soft",
+      label: "Soft",
+      hint: "Gentle sound + notification. Less sticky, lighter vibration.",
+    },
+    {
+      id: "full",
+      label: "Full",
+      hint: "Louder cue and stronger vibration when time is up.",
+    },
+  ];
+  return shell([
+    el("button", { className: "nav-back", text: "← Home", onClick: () => go("home") }),
+    el("div", { className: "panel stack" }, [
+      el("h2", { text: "Alerts" }),
+      el("p", {
+        className: "meta",
+        text: "You can turn alerts off anytime — your lists still work.",
+      }),
+      ...options.map((opt) =>
+        el(
+          "button",
+          {
+            className: `choice ${mode === opt.id ? "selected" : ""}`,
+            onClick: () => setNotificationMode(opt.id),
+          },
+          [
+            el("span", { className: "label", text: opt.label }),
+            el("span", { className: "hint", text: opt.hint }),
+          ]
+        )
+      ),
+      mode !== "off" &&
+      notificationsSupported() &&
+      !hasNotificationPermission()
+        ? el("button", {
+            className: "btn btn-primary btn-block",
+            text: "Enable device notifications",
+            onClick: () => ensureNotificationPermission().then(() => render()),
+          })
+        : null,
+    ]),
+  ]);
+}
+
+function quickStartTimer(minutes) {
+  const now = Date.now();
+  setReminders([
+    {
+      id: uid(),
+      createdAt: now,
+      title: `${minutes}-minute timer`,
+      mode: "TIMER",
+      timerMinutes: minutes,
+      repeat: null,
+      triggerAt: now + minutes * 60 * 1000,
+      status: "SCHEDULED",
+      notified: false,
+      updatedAt: now,
+      completedAt: null,
+    },
+    ...state.reminders,
+  ]);
+  if (getNotificationMode() !== "off") ensureNotificationPermission();
+  showAlert(`${minutes}-minute timer is running.`, { title: "Timer started", okLabel: "Got it" });
+}
+
+function quickCaptureGoal(title) {
+  const trimmed = (title || "").trim();
+  if (!trimmed) {
+    showAlert("Name the goal first.");
+    return;
+  }
+  const now = Date.now();
+  setGoals([
+    {
+      id: uid(),
+      title: trimmed,
+      notes: null,
+      importance: "IMPORTANT",
+      scheduling: { type: "URGENCY", urgency: "NOT_SO_URGENT" },
+      estimatedMinutes: 25,
+      status: "PENDING",
+      createdAt: now,
+      updatedAt: now,
+      completedAt: null,
+    },
+    ...state.goals,
+  ]);
+  state.quickCapture = false;
+  flashComplete();
+  render();
+}
+
+function startFreeTimeWindow(minutes) {
+  state.freeMinutes = minutes;
+  const packed = packTasks(state.goals, state.targets, minutes);
+  if (!packed.length) {
+    showAlert("Nothing fits that window. Add a shorter goal or target first.");
+    return;
+  }
+  state.packed = packed;
+  state.arrangeAddOpen = false;
+  state.editingPackId = null;
+  go("arrange");
+}
+
+function pauseTarget(id) {
+  const now = Date.now();
+  setTargets(
+    state.targets.map((t) =>
+      t.id === id ? { ...ensureTargetPeriod(t, now), paused: true, updatedAt: now } : t
+    )
+  );
+  state.packed = state.packed.filter((p) => !(p.kind === "target" && p.sourceId === id));
+  if (state.screen === "itemDetail") closeItemDetail();
+  else render();
+}
+
+function resumeTarget(id) {
+  const now = Date.now();
+  setTargets(
+    state.targets.map((t) =>
+      t.id === id ? { ...ensureTargetPeriod(t, now), paused: false, updatedAt: now } : t
+    )
+  );
+  if (state.screen === "itemDetail") closeItemDetail();
+  else render();
 }
 
 function activeGoals() {
@@ -1009,7 +1579,7 @@ function canCompleteEntity(kind, entity) {
     return entity.status === "PENDING" || entity.status === "OVERDUE" || entity.status === "IN_PROGRESS";
   }
   if (kind === "reminder") return entity.status !== "COMPLETED";
-  if (kind === "target") return entity.completionsInPeriod < entity.frequency;
+  if (kind === "target") return !entity.paused && entity.completionsInPeriod < entity.frequency;
   return false;
 }
 
@@ -1058,6 +1628,7 @@ function uncompleteTarget(id) {
 }
 
 function completeEntity(kind, id) {
+  flashComplete();
   if (kind === "goal") completeGoal(id);
   else if (kind === "reminder") completeReminder(id);
   else if (kind === "target") completeTarget(id);
@@ -1084,14 +1655,25 @@ function editEntity(kind, id) {
 }
 
 function deleteEntity(kind, id) {
-  if (!confirm("Delete this permanently?")) return;
-  if (kind === "goal") deleteGoal(id);
-  else if (kind === "reminder") deleteReminder(id);
-  else if (kind === "target") {
-    state.packed = state.packed.filter((p) => !(p.kind === "target" && p.sourceId === id));
-    deleteTarget(id);
-  }
-  if (state.screen === "itemDetail") closeItemDetail();
+  showConfirm(
+    "Delete this permanently? This can’t be undone.",
+    () => {
+      if (kind === "goal") deleteGoal(id);
+      else if (kind === "reminder") deleteReminder(id);
+      else if (kind === "target") {
+        state.packed = state.packed.filter((p) => !(p.kind === "target" && p.sourceId === id));
+        deleteTarget(id);
+      }
+      if (state.screen === "itemDetail") closeItemDetail();
+      else render();
+    },
+    {
+      title: "Delete",
+      confirmLabel: "Delete",
+      cancelLabel: "Keep it",
+      danger: true,
+    }
+  );
 }
 
 function openItemDetail(kind, id) {
@@ -1146,9 +1728,11 @@ function renderItemDetail() {
   } else if (kind === "target") {
     const t = ensureTargetPeriod(entity);
     const imp = Importance[t.importance];
-    tone = imp.color;
+    tone = t.paused ? "blue" : imp.color;
     title = `◎ ${t.title}`;
-    meta = `${Period[t.period].label} · ${t.completionsInPeriod}/${t.frequency} · ${formatMinutes(t.estimatedMinutes)} · score ${scoreTarget(t)}`;
+    meta = t.paused
+      ? `Paused · ${Period[t.period].label} · ${t.completionsInPeriod}/${t.frequency}`
+      : `${Period[t.period].label} · ${t.completionsInPeriod}/${t.frequency} · ${formatMinutes(t.estimatedMinutes)} · score ${scoreTarget(t)}`;
   }
 
   return shell([
@@ -1177,6 +1761,20 @@ function renderItemDetail() {
               className: "btn btn-primary btn-block",
               text: "Uncomplete",
               onClick: () => uncompleteEntity(kind, id),
+            })
+          : null,
+        kind === "target" && !entity.paused
+          ? el("button", {
+              className: "btn btn-ghost btn-block",
+              text: "Pause target",
+              onClick: () => pauseTarget(id),
+            })
+          : null,
+        kind === "target" && entity.paused
+          ? el("button", {
+              className: "btn btn-primary btn-block",
+              text: "Resume target",
+              onClick: () => resumeTarget(id),
             })
           : null,
         el("button", {
@@ -1335,7 +1933,7 @@ function saveReminderFromWizard() {
     setReminders([{ id: uid(), createdAt: now, ...payload }, ...state.reminders]);
   }
   state.remind = null;
-  ensureNotificationPermission();
+  if (getNotificationMode() !== "off") ensureNotificationPermission();
   finishWizard("home");
 }
 
@@ -1528,7 +2126,7 @@ function buildCalendarEvents(rangeStart, rangeEnd) {
   const rangeDays = Math.round((rangeEnd - rangeStart) / (24 * 60 * 60 * 1000));
   for (const raw of state.targets) {
     const t = ensureTargetPeriod(raw, now);
-    if (isTargetCompletedForPeriod(t)) continue;
+    if (t.paused || isTargetCompletedForPeriod(t)) continue;
     const imp = Importance[t.importance];
     const periodStart = t.periodStart;
     const periodEnd = nextPeriodStart(t.period, periodStart);
@@ -1837,41 +2435,154 @@ function renderCalendar() {
 function renderHome() {
   const active = activeGoals();
   const due = dueReminders();
+  const mode = getNotificationMode();
 
   return shell([
     el("div", { className: "home-top" }, [
       el("p", { className: "brand", text: "Time Flow" }),
-      el(
-        "button",
-        {
-          className: "cal-icon-btn",
-          title: "Calendar",
-          "aria-label": "Calendar",
-          onClick: () => {
-            state.calendarCursor = Date.now();
-            go("calendar");
+      el("div", { className: "home-top-actions" }, [
+        el(
+          "button",
+          {
+            className: "cal-icon-btn",
+            title: "Alerts",
+            "aria-label": "Alerts",
+            onClick: () => go("alerts"),
           },
-        },
-        [
-          (() => {
-            const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-            svg.setAttribute("viewBox", "0 0 24 24");
-            svg.setAttribute("width", "22");
-            svg.setAttribute("height", "22");
-            svg.setAttribute("aria-hidden", "true");
-            svg.innerHTML =
-              '<rect x="3" y="5" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>' +
-              '<path d="M3 10h18" fill="none" stroke="currentColor" stroke-width="1.8"/>' +
-              '<path d="M8 3v4M16 3v4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>';
-            return svg;
-          })(),
-        ]
-      ),
+          [
+            (() => {
+              const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+              svg.setAttribute("viewBox", "0 0 24 24");
+              svg.setAttribute("width", "20");
+              svg.setAttribute("height", "20");
+              svg.setAttribute("aria-hidden", "true");
+              svg.innerHTML =
+                '<path d="M12 22a2 2 0 0 0 2-2h-4a2 2 0 0 0 2 2zm6-6V11a6 6 0 1 0-12 0v5l-2 2v1h16v-1l-2-2z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>';
+              return svg;
+            })(),
+          ]
+        ),
+        el(
+          "button",
+          {
+            className: "cal-icon-btn",
+            title: "Calendar",
+            "aria-label": "Calendar",
+            onClick: () => {
+              state.calendarCursor = Date.now();
+              go("calendar");
+            },
+          },
+          [
+            (() => {
+              const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+              svg.setAttribute("viewBox", "0 0 24 24");
+              svg.setAttribute("width", "22");
+              svg.setAttribute("height", "22");
+              svg.setAttribute("aria-hidden", "true");
+              svg.innerHTML =
+                '<rect x="3" y="5" width="18" height="16" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/>' +
+                '<path d="M3 10h18" fill="none" stroke="currentColor" stroke-width="1.8"/>' +
+                '<path d="M8 3v4M16 3v4" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>';
+              return svg;
+            })(),
+          ]
+        ),
+      ]),
     ]),
     el("p", {
       className: "lede",
       text: "Capture goals. Spend free time on what matters.",
     }),
+    el("div", { className: "panel stack quick-strip" }, [
+      el("p", { className: "step-meta", text: "Quick" }),
+      el(
+        "div",
+        { className: "chips" },
+        [5, 10, 15].map((m) =>
+          el("button", {
+            className: "chip",
+            text: `${m} min`,
+            onClick: () => quickStartTimer(m),
+          })
+        )
+      ),
+      el(
+        "div",
+        { className: "chips" },
+        [
+          el("button", {
+            className: "chip",
+            text: "Start 25",
+            onClick: () => startFreeTimeWindow(25),
+          }),
+          el("button", {
+            className: "chip chip-accent",
+            text: "+ Capture",
+            onClick: () => {
+              state.quickCapture = true;
+              render();
+            },
+          }),
+        ]
+      ),
+      state.quickCapture
+        ? (() => {
+            let titleVal = "";
+            const input = el("input", {
+              type: "text",
+              placeholder: "What’s on your mind?",
+              value: "",
+              onInput: (e) => {
+                titleVal = e.target.value;
+              },
+            });
+            wireGoKey(input, () => quickCaptureGoal(titleVal || input.value));
+            setTimeout(() => input.focus(), 0);
+            return el("div", { className: "stack quick-capture" }, [
+              el("div", { className: "field" }, [
+                el("label", { text: "Quick goal" }),
+                input,
+              ]),
+              el("div", { className: "row" }, [
+                el("button", {
+                  className: "btn btn-ghost",
+                  style: "flex:1",
+                  text: "Cancel",
+                  onClick: () => {
+                    state.quickCapture = false;
+                    render();
+                  },
+                }),
+                el("button", {
+                  className: "btn btn-primary",
+                  style: "flex:1",
+                  text: "Save",
+                  onClick: () => quickCaptureGoal(titleVal || input.value),
+                }),
+              ]),
+            ]);
+          })()
+        : null,
+    ]),
+    mode !== "off" &&
+    !hasNotificationPermission() &&
+    notificationsSupported() &&
+    state.reminders.some((r) => r.status === "SCHEDULED" || r.status === "DUE")
+      ? el("div", { className: "panel stack" }, [
+          el("p", {
+            className: "meta",
+            text: "Turn on notifications so reminders alert you when time is up — even if the app is closed (APK). You can soften or turn them off in Alerts.",
+          }),
+          el("button", {
+            className: "btn btn-primary btn-block",
+            text: "Enable notifications",
+            onClick: () => {
+              ensureNotificationPermission().then(() => render());
+            },
+          }),
+        ])
+      : null,
     el("div", { className: "panel stack" }, [
       el("button", {
         className: "btn btn-primary btn-block",
@@ -1958,7 +2669,7 @@ function renderHome() {
                   openOnClick: true,
                 });
               })
-            : [el("p", { className: "empty", text: "No pending goals." })]),
+            : [el("p", { className: "empty", text: "No pending goals — that’s fine." })]),
           seeMore("goals", homeGoals.length, "goals"),
         ]),
         el("div", { className: "panel stack" }, [
@@ -1976,7 +2687,7 @@ function renderHome() {
                   openOnClick: true,
                 });
               })
-            : [el("p", { className: "empty", text: "No open targets this period." })]),
+            : [el("p", { className: "empty", text: "Nothing open — that’s fine." })]),
           seeMore("targets", homeTargets.length, "targets"),
         ]),
       ]);
@@ -2089,11 +2800,11 @@ function renderRemind() {
         (() => {
           const saveAt = () => {
             if (!w.datetimeLocal) {
-              alert("Pick a date and time.");
+              showAlert("Pick a date and time.");
               return;
             }
             if (new Date(w.datetimeLocal).getTime() <= Date.now()) {
-              alert("Pick a time in the future.");
+              showAlert("Pick a time in the future.");
               return;
             }
             saveReminderFromWizard();
@@ -2205,7 +2916,7 @@ function renderRemind() {
               ]),
               nextButton("Save reminder", () => {
                 if (!trySaveRepeatReminder()) {
-                  alert("Pick at least one day and a time.");
+                  showAlert("Pick at least one day and a time.");
                 }
               }),
             ]),
@@ -2235,7 +2946,7 @@ function renderRemind() {
               ]),
               nextButton("Save reminder", () => {
                 if (!trySaveRepeatReminder()) {
-                  alert("Pick at least one day and a time.");
+                  showAlert("Pick at least one day and a time.");
                 }
               }),
             ]),
@@ -2774,7 +3485,8 @@ function renderTargets() {
     setTargets(targets);
   }
 
-  const active = targets.filter((t) => !isTargetCompletedForPeriod(t));
+  const active = targets.filter((t) => !t.paused && !isTargetCompletedForPeriod(t));
+  const paused = targets.filter((t) => t.paused && !isTargetCompletedForPeriod(t));
   const donePeriod = targets.filter((t) => isTargetCompletedForPeriod(t));
 
   return shell([
@@ -2783,7 +3495,7 @@ function renderTargets() {
       el("h2", { text: "Targets" }),
       el("p", {
         className: "meta",
-        text: "Habits with a quota. Complete here or via free time. Score = urgency × importance.",
+        text: "Habits with a quota. Pause anytime — it’s parked, not failed.",
       }),
       el("button", {
         className: "btn btn-primary btn-block",
@@ -2795,7 +3507,7 @@ function renderTargets() {
       }),
     ]),
     el("div", { className: "panel" }, [
-      el("h2", { text: "This period" }),
+      el("h2", { text: "This period (resets gently)" }),
       ...(active.length
         ? active.map((t) => {
             const imp = Importance[t.importance];
@@ -2807,8 +3519,28 @@ function renderTargets() {
               tone: imp.color,
             });
           })
-        : [el("p", { className: "empty", text: "No open targets this period." })]),
+        : [el("p", { className: "empty", text: "Nothing open — that’s fine." })]),
     ]),
+    paused.length
+      ? el("div", { className: "panel stack" }, [
+          el("h2", { text: "Paused" }),
+          el("p", {
+            className: "meta",
+            text: "Hidden from packing until you resume.",
+          }),
+          ...paused.map((t) =>
+            renderEntityCard({
+              kind: "target",
+              id: t.id,
+              title: t.title,
+              meta: `${Period[t.period].label} · ${t.completionsInPeriod}/${t.frequency} · paused`,
+              tone: "blue",
+              muted: true,
+              actions: { complete: false, edit: true, remove: true, uncomplete: false },
+            })
+          ),
+        ])
+      : null,
     donePeriod.length
       ? el("div", { className: "panel stack" }, [
           el("h2", { text: "Completed" }),
@@ -2836,7 +3568,7 @@ function renderFreeTime() {
       el(
         "div",
         { className: "chips" },
-        [15, 30, 45, 60, 90].map((m) =>
+        [15, 25, 30, 45, 60, 90].map((m) =>
           el("button", {
             className: `chip ${state.freeMinutes === m ? "selected" : ""}`,
             text: formatMinutes(m),
@@ -2864,7 +3596,7 @@ function renderFreeTime() {
         onClick: () => {
           const packed = packTasks(state.goals, state.targets, state.freeMinutes);
           if (!packed.length) {
-            alert("Nothing fits that window. Add a shorter goal or target first.");
+            showAlert("Nothing fits that window. Add a shorter goal or target first.");
             return;
           }
           state.packed = packed;
@@ -2905,7 +3637,7 @@ function sprintItemFromDraft(draft) {
 function commitSprintDraft({ thenPrepare = false } = {}) {
   const d = state.sprintDraft;
   if (!d || !d.title.trim()) {
-    alert("Name this sprint task first.");
+    showAlert("Name this sprint task first.");
     return false;
   }
   state.sprintItems = [...state.sprintItems, sprintItemFromDraft(d)];
@@ -2916,7 +3648,7 @@ function commitSprintDraft({ thenPrepare = false } = {}) {
   };
   if (thenPrepare) {
     if (!state.sprintItems.length) {
-      alert("Add at least one task.");
+      showAlert("Add at least one task.");
       return false;
     }
     state.editingSprintId = null;
@@ -3255,7 +3987,7 @@ function renderSprintArrange() {
         text: "Start sprint",
         onClick: () => {
           if (!state.sprintItems.length) {
-            alert("Add at least one task.");
+            showAlert("Add at least one task.");
             return;
           }
           const totalMins = sprintTotalMinutes();
@@ -3273,6 +4005,7 @@ function renderSprintArrange() {
             skipped: [],
           };
           startTick();
+          syncNativeTimers();
           go("focus");
         },
       }),
@@ -3322,15 +4055,24 @@ function removeFromPacked(id) {
 function addToPacked(item) {
   if (state.packed.some((g) => g.id === item.id)) return;
   const nextTotal = packedTotalMinutes() + item.estimatedMinutes;
+  const finishAdd = () => {
+    state.packed = [...state.packed, { ...item }];
+    state.arrangeAddOpen = false;
+    render();
+  };
   if (nextTotal > state.freeMinutes) {
-    const ok = confirm(
-      `This goes over your free time (${formatMinutes(nextTotal)} / ${formatMinutes(state.freeMinutes)}). Add anyway?`
+    showConfirm(
+      `This goes over your free time (${formatMinutes(nextTotal)} / ${formatMinutes(state.freeMinutes)}). Add anyway?`,
+      finishAdd,
+      {
+        title: "Over free time",
+        confirmLabel: "Add anyway",
+        cancelLabel: "Cancel",
+      }
     );
-    if (!ok) return;
+    return;
   }
-  state.packed = [...state.packed, { ...item }];
-  state.arrangeAddOpen = false;
-  render();
+  finishAdd();
 }
 
 function updatePackedItem(item, patch) {
@@ -3576,7 +4318,7 @@ function renderArrange() {
         text: "Start focus",
         onClick: () => {
           if (!state.packed.length) {
-            alert("Add at least one task.");
+            showAlert("Add at least one task.");
             return;
           }
           const firstTaskSecs = state.packed[0].estimatedMinutes * 60;
@@ -3593,6 +4335,7 @@ function renderArrange() {
             skipped: [],
           };
           startTick();
+          syncNativeTimers();
           go("focus");
         },
       }),
@@ -3610,15 +4353,43 @@ function renderTaskRing(session) {
   const r = (size - stroke) / 2;
   const c = 2 * Math.PI * r;
   const offset = c * (1 - remaining);
+  const cx = size / 2;
+  const cy = size / 2;
+
+  let ticksHtml = "";
+  if (total >= 15 * 60) {
+    const tickEvery = 15 * 60;
+    for (let t = tickEvery; t < total; t += tickEvery) {
+      const frac = t / total;
+      const angle = frac * 2 * Math.PI;
+      const inner = r - 6;
+      const outer = r + 6;
+      const x1 = cx + Math.cos(angle) * inner;
+      const y1 = cy + Math.sin(angle) * inner;
+      const x2 = cx + Math.cos(angle) * outer;
+      const y2 = cy + Math.sin(angle) * outer;
+      ticksHtml +=
+        `<line class="task-ring-tick" x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" ` +
+        `x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" />`;
+    }
+  }
+
+  const minsLeft = Math.max(0, Math.ceil(left / 60));
+  const subText = session.paused
+    ? "Paused"
+    : left < 60
+      ? `${left}s left`
+      : `${minsLeft} min left · ${Math.round(remaining * 100)}%`;
 
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.setAttribute("viewBox", `0 0 ${size} ${size}`);
   svg.setAttribute("class", `task-ring-svg${urgent ? " is-urgent" : ""}${session.paused ? " is-paused" : ""}`);
   svg.setAttribute("aria-hidden", "true");
   svg.innerHTML =
-    `<circle class="task-ring-track" cx="${size / 2}" cy="${size / 2}" r="${r}" ` +
+    `<circle class="task-ring-track" cx="${cx}" cy="${cy}" r="${r}" ` +
     `fill="none" stroke-width="${stroke}"/>` +
-    `<circle class="task-ring-progress" cx="${size / 2}" cy="${size / 2}" r="${r}" ` +
+    ticksHtml +
+    `<circle class="task-ring-progress" cx="${cx}" cy="${cy}" r="${r}" ` +
     `fill="none" stroke-width="${stroke}" stroke-linecap="round" ` +
     `stroke-dasharray="${c.toFixed(2)}" stroke-dashoffset="${offset.toFixed(2)}"/>`;
 
@@ -3632,7 +4403,7 @@ function renderTaskRing(session) {
         el("div", { className: "time", text: formatClock(left) }),
         el("div", {
           className: "task-ring-sub",
-          text: session.paused ? "Paused" : `${Math.round(remaining * 100)}% left`,
+          text: subText,
         }),
       ]),
     ]
@@ -3649,12 +4420,30 @@ function renderFocus() {
   if (!session.taskTotal) {
     session.taskTotal = Math.max(session.taskLeft, current.estimatedMinutes * 60);
   }
+  const sessionTotal = Math.max(1, session.totalSeconds || session.sessionLeft || 1);
+  const sessionElapsed = Math.min(1, (sessionTotal - session.sessionLeft) / sessionTotal);
+  const sessionMinsLeft = Math.max(0, Math.ceil(session.sessionLeft / 60));
 
   return shell([
     el("div", { className: "panel stack focus-panel" }, [
       el("div", { className: "session-strip" }, [
         el("span", { className: "name", text: isSprint ? "Sprint" : "Session" }),
-        el("span", { className: "time", text: formatClock(session.sessionLeft) }),
+        el("span", {
+          className: "time",
+          text: `${formatClock(session.sessionLeft)} · ${sessionMinsLeft} min left`,
+        }),
+      ]),
+      el("div", {
+        className: "session-progress",
+        role: "progressbar",
+        "aria-valuemin": "0",
+        "aria-valuemax": "100",
+        "aria-valuenow": String(Math.round(sessionElapsed * 100)),
+      }, [
+        el("div", {
+          className: "session-progress-fill",
+          style: `width:${Math.round(sessionElapsed * 100)}%`,
+        }),
       ]),
       renderTaskRing(session),
       el("div", {}, [
@@ -3674,6 +4463,7 @@ function renderFocus() {
           text: "Done",
           style: "flex:1",
           onClick: () => {
+            flashComplete();
             session.completed.push(current.id);
             autoAdvance("done");
           },
@@ -3693,8 +4483,14 @@ function renderFocus() {
         text: session.paused ? "Resume" : "Pause",
         onClick: () => {
           session.paused = !session.paused;
+          syncNativeTimers();
           render();
         },
+      }),
+      el("button", {
+        className: "btn btn-ghost btn-block",
+        text: "Leave (keep running)",
+        onClick: () => go("home"),
       }),
       el("button", {
         className: "btn btn-danger btn-block",
@@ -3734,6 +4530,10 @@ function renderSummary() {
         el("span", { text: "Time used" }),
         el("strong", { text: formatClock(s.usedSeconds) }),
       ]),
+      el("p", {
+        className: "meta",
+        text: "Skipped is allowed. Come back when you’re ready.",
+      }),
       isSprint
         ? el("p", {
             className: "meta",
@@ -3751,3 +4551,10 @@ function renderSummary() {
 
 render();
 startReminderPoll();
+syncNativeReminders();
+if (
+  getNotificationMode() !== "off" &&
+  state.reminders.some((r) => r.status === "SCHEDULED")
+) {
+  ensureNotificationPermission();
+}

@@ -1,5 +1,5 @@
 /* Time Flow — offline shell for phone install */
-const CACHE = "timeflow-shell-v2";
+const CACHE = "timeflow-shell-v6";
 const ASSETS = [
   "./",
   "./index.html",
@@ -43,4 +43,23 @@ self.addEventListener("fetch", (event) => {
       return cached || network;
     })
   );
+});
+
+self.addEventListener("message", (event) => {
+  const data = event.data;
+  if (!data) return;
+  if (data.type === "APP_NOTIFICATION" || data.type === "REMINDER_DUE") {
+    const heading = data.heading || "Time Flow — Remind me";
+    const body = data.body || data.title || "Reminder";
+    const tag = data.tag || `timeflow-${data.id || "due"}`;
+    event.waitUntil(
+      self.registration.showNotification(heading, {
+        body,
+        tag,
+        requireInteraction: !data.soft,
+        icon: "./icons/icon-192.png",
+        silent: false,
+      })
+    );
+  }
 });
