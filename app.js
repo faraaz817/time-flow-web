@@ -380,6 +380,8 @@ const state = {
   dialog: null,
   prefs: loadPrefs(),
   quickCapture: false,
+  quickCaptureTitle: "",
+  quickCaptureNeedsFocus: false,
   completeFlash: null,
 };
 
@@ -647,6 +649,39 @@ function clearNativeTimers() {
   }
 }
 
+function uiInputLocked() {
+  return Boolean(state.quickCapture || state.dialog);
+}
+
+function patchStickySessionLive() {
+  const sticky = document.querySelector(".sticky-session");
+  if (!sticky || !state.session) return;
+  const session = state.session;
+  const current = session.queue[session.index];
+  const label = sticky.querySelector(".sticky-session-label");
+  const title = sticky.querySelector(".sticky-session-title");
+  const time = sticky.querySelector(".sticky-session-time");
+  const pauseBtn = sticky.querySelector(".sticky-session-pause");
+  const isSprint = session.mode === "sprint";
+  if (label) label.textContent = session.paused ? "Paused" : isSprint ? "Sprint" : "In focus";
+  if (title) title.textContent = current?.title || "Session";
+  if (time) time.textContent = formatClock(session.taskLeft);
+  if (pauseBtn) {
+    pauseBtn.textContent = session.paused ? "▶" : "❚❚";
+    pauseBtn.title = session.paused ? "Resume" : "Pause";
+    pauseBtn.setAttribute("aria-label", session.paused ? "Resume" : "Pause");
+  }
+}
+
+/** Periodic refresh that must not wipe open inputs (quick capture / dialogs). */
+function liveRefresh() {
+  if (uiInputLocked()) {
+    patchStickySessionLive();
+    return;
+  }
+  render();
+}
+
 function checkReminders() {
   state.now = Date.now();
   let changed = false;
@@ -678,12 +713,12 @@ function checkReminders() {
   if (changed) {
     setReminders(next);
     if (state.screen === "home" || state.screen === "reminders" || state.screen === "calendar") {
-      render();
+      liveRefresh();
     }
   } else if (state.screen === "home" || state.screen === "remind" || state.screen === "reminders") {
-    // refresh countdowns on home without full rebuild every second only for scheduled timers
+    // refresh countdowns on home — never rebuild while typing in quick capture
     const hasLive = state.reminders.some((r) => r.status === "SCHEDULED");
-    if (hasLive && state.screen === "home") render();
+    if (hasLive && state.screen === "home") liveRefresh();
   }
 }
 
@@ -730,7 +765,8 @@ function startTick() {
       endSession();
       return;
     }
-    render();
+    if (state.screen === "focus") render();
+    else liveRefresh();
   }, 1000);
 }
 
@@ -1087,7 +1123,11 @@ function flashComplete() {
   setTimeout(() => {
     if (!state.completeFlash) return;
     state.completeFlash = null;
-    render();
+    if (!uiInputLocked()) render();
+    else {
+      const flash = document.querySelector(".complete-flash");
+      if (flash) flash.remove();
+    }
   }, 750);
 }
 
@@ -1240,6 +1280,8 @@ function quickCaptureGoal(title) {
     ...state.goals,
   ]);
   state.quickCapture = false;
+  state.quickCaptureTitle = "";
+  state.quickCaptureNeedsFocus = false;
   flashComplete();
   render();
 }
@@ -2521,6 +2563,8 @@ function renderHome() {
             text: "+ Capture",
             onClick: () => {
               state.quickCapture = true;
+              state.quickCaptureTitle = "";
+              state.quickCaptureNeedsFocus = true;
               render();
             },
           }),
@@ -2528,17 +2572,19 @@ function renderHome() {
       ),
       state.quickCapture
         ? (() => {
-            let titleVal = "";
             const input = el("input", {
               type: "text",
               placeholder: "What’s on your mind?",
-              value: "",
+              value: state.quickCaptureTitle || "",
               onInput: (e) => {
-                titleVal = e.target.value;
+                state.quickCaptureTitle = e.target.value;
               },
             });
-            wireGoKey(input, () => quickCaptureGoal(titleVal || input.value));
-            setTimeout(() => input.focus(), 0);
+            wireGoKey(input, () => quickCaptureGoal(state.quickCaptureTitle || input.value));
+            if (state.quickCaptureNeedsFocus) {
+              state.quickCaptureNeedsFocus = false;
+              setTimeout(() => input.focus(), 0);
+            }
             return el("div", { className: "stack quick-capture" }, [
               el("div", { className: "field" }, [
                 el("label", { text: "Quick goal" }),
@@ -2551,6 +2597,8 @@ function renderHome() {
                   text: "Cancel",
                   onClick: () => {
                     state.quickCapture = false;
+                    state.quickCaptureTitle = "";
+                    state.quickCaptureNeedsFocus = false;
                     render();
                   },
                 }),
@@ -2558,7 +2606,7 @@ function renderHome() {
                   className: "btn btn-primary",
                   style: "flex:1",
                   text: "Save",
-                  onClick: () => quickCaptureGoal(titleVal || input.value),
+                  onClick: () => quickCaptureGoal(state.quickCaptureTitle || input.value),
                 }),
               ]),
             ]);

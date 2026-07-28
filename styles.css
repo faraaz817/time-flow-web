@@ -846,10 +846,6 @@ h2 {
   flex-shrink: 0;
 }
 
-.quick-capture {
-  animation: strip-in 0.22s ease;
-}
-
 .chip-accent {
   border-color: rgba(26, 23, 20, 0.28);
   background: rgba(255, 255, 255, 0.92);

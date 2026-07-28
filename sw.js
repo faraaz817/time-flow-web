@@ -1,5 +1,5 @@
 /* Time Flow — offline shell for phone install */
-const CACHE = "timeflow-shell-v7";
+const CACHE = "timeflow-shell-v8";
 const ASSETS = [
   "./",
   "./index.html",
