@@ -846,10 +846,6 @@ h2 {
   flex-shrink: 0;
 }
 
-.quick-strip {
-  animation: strip-in 0.28s ease;
-}
-
 .quick-capture {
   animation: strip-in 0.22s ease;
 }
@@ -908,7 +904,6 @@ h2 {
   display: flex;
   gap: 8px;
   align-items: stretch;
-  animation: strip-in 0.25s ease;
 }
 
 .sticky-session-main {
